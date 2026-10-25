@@ -1,0 +1,209 @@
+openapi: 3.1.0
+info:
+  title: єГастро ML Recommendation Service
+  version: 1.0.0
+  description: |
+    Контракт між backend (Spring Boot) і ML-сервісом «Розумний кошик» (EG-5).
+
+    * Сервіс **замінний за контрактом** (system-first): будь-яка реалізація, що
+      дотримується цієї специфікації, підходить backend без змін.
+    * Сервіс доступний **лише у внутрішній мережі**; автентифікації немає.
+    * Рекомендації залежать від вмісту кошика, а не від профілю користувача.
+
+    Таймаути на стороні backend: connect 200 мс, read 300 мс. Цільова латентність
+    сервісу — p95 ≤ 100 мс. Будь-яка помилка, таймаут чи не-2xx відповідь → backend
+    використовує fallback «Популярне» (`source: FALLBACK`); помилка не доходить до frontend.
+
+    Відповідальність за фільтрацію:
+    * ML-сервіс: виключає товари з кошика й дублікати, повертає кандидатів за спаданням score.
+    * Backend: виключає невідомі/недоступні товари та застосовує бізнес-фільтри
+      (обмежені категорії, замінники з тієї ж підкатегорії, ≤ 2 товари з категорії).
+    * Контрольна група (holdout 10 %): backend не викликає ML-сервіс і віддає fallback,
+      факт показу логується з `model_version: null`.
+servers:
+  - url: http://localhost:8000
+    description: Локальна розробка (backend `ML_SERVICE_URL`)
+paths:
+  /v1/recommendations:
+    post:
+      operationId: getCartRecommendations
+      summary: Рекомендації супутніх товарів за вмістом кошика
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecommendationRequest'
+            example:
+              cart_item_ids: [12, 45, 78]
+              max_k: 10
+      responses:
+        '200':
+          description: |
+            Кандидати, відсортовані за `score` за спаданням. Порожній масив — валідна
+            відповідь (правил немає) → backend переходить на fallback.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecommendationResponse'
+              examples:
+                model:
+                  summary: Є правила для кошика
+                  value:
+                    model_version: '2026-10-25'
+                    recommendations:
+                      - product_id: 101
+                        score: 0.41
+                        metrics: { support: 0.012, confidence: 0.41, lift: 3.42 }
+                      - product_id: 205
+                        score: 0.33
+                        metrics: { support: 0.008, confidence: 0.33, lift: 2.10 }
+                empty:
+                  summary: Немає відповідних правил
+                  value:
+                    model_version: '2026-10-25'
+                    recommendations: []
+        '422':
+          description: Некоректний запит (порожній або задовгий список, max_k поза 1–50, нечислові ID)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: validation_error
+                detail: 'max_k must be between 1 and 50'
+        '503':
+          description: Модель ще не завантажена або недоступна
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: model_unavailable
+                detail: 'No rules loaded'
+        '500':
+          description: Неочікувана помилка сервісу
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /health:
+    get:
+      operationId: getHealth
+      summary: Стан сервісу й завантаженої моделі (для Docker healthcheck і моніторингу)
+      responses:
+        '200':
+          description: Сервіс працює, модель завантажена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+              example:
+                status: ok
+                model_version: '2026-10-25'
+                rules_count: 1840
+        '503':
+          description: Сервіс працює, але модель не завантажена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+              example:
+                status: model_unavailable
+                model_version: null
+                rules_count: 0
+components:
+  schemas:
+    RecommendationRequest:
+      type: object
+      additionalProperties: false
+      required: [cart_item_ids, max_k]
+      properties:
+        cart_item_ids:
+          description: |
+            Унікальні ID товарів каталогу з кошика (не ID рядків кошика), у порядку
+            кошика. Порожній кошик backend не надсилає.
+          type: array
+          minItems: 1
+          maxItems: 50
+          uniqueItems: true
+          items:
+            type: integer
+            format: int64
+            minimum: 1
+        max_k:
+          description: Скільки кандидатів повернути максимум (backend просить min(limit × 2, 50)).
+          type: integer
+          minimum: 1
+          maximum: 50
+    RecommendationResponse:
+      type: object
+      required: [recommendations]
+      properties:
+        model_version:
+          description: |
+            Версія набору правил (дата навчання). Backend логує її в rec_events для
+            моніторингу й відкату. Необов'язкове поле — backend, що його не знає, ігнорує.
+          type: [string, 'null']
+          examples: ['2026-10-25']
+        recommendations:
+          description: Не більше max_k записів, без товарів з кошика й без дублікатів.
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/Recommendation'
+    Recommendation:
+      type: object
+      required: [product_id, score]
+      properties:
+        product_id:
+          type: integer
+          format: int64
+          minimum: 1
+        score:
+          description: |
+            Релевантність, більше — краще. У v1 = max confidence серед правил A→B,
+            де A ⊆ кошика (діапазон 0–1). Backend лише сортує за score.
+          type: number
+        metrics:
+          oneOf:
+            - $ref: '#/components/schemas/RuleMetrics'
+            - type: 'null'
+    RuleMetrics:
+      description: Метрики правила, що дало найвищий score. Усі поля необов'язкові.
+      type: object
+      properties:
+        support:
+          type: [number, 'null']
+          minimum: 0
+          maximum: 1
+        confidence:
+          type: [number, 'null']
+          minimum: 0
+          maximum: 1
+        lift:
+          type: [number, 'null']
+          minimum: 0
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          description: Машиночитаний код помилки
+          type: string
+          enum: [validation_error, model_unavailable, internal_error]
+        detail:
+          description: Опис для логів; без даних кошика
+          type: string
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, model_unavailable]
+        model_version:
+          type: [string, 'null']
+        rules_count:
+          type: integer
+          minimum: 0
