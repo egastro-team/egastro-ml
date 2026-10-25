@@ -1,0 +1,24 @@
+paths:
+  raw: data/raw
+  processed: data/processed
+  models: models
+  reports: reports
+
+datasets:
+  instacart: data/raw/instacart      # orders.csv, order_products__prior.csv, products.csv, aisles.csv, departments.csv
+  groceries: data/raw/groceries      # groceries.csv (транзакції, по рядку на чек)
+
+rules:
+  min_support: 0.001
+  min_confidence: 0.1
+  min_lift: 1.2
+  max_antecedent_len: 2
+
+recommendations:
+  top_k: 5            # показуємо 4–6
+  max_per_category: 2
+
+training:
+  window_days: 90
+  holdout_share: 0.10
+  random_seed: 42
